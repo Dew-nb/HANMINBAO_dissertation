@@ -1,0 +1,551 @@
+---
+title: "HanminBao_dissertation"
+author: "Hanmin Bao"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load package
+
+```{r,include=FALSE}
+library(BiocManager)
+library(TCGAbiolinks)
+library(ggplot2)
+library(gplots)
+library(dplyr)
+library(caret)
+library(mlr)
+library(patchwork)
+library(randtests)
+library(e1071)
+library(DT)
+library(SummarizedExperiment)
+library(edgeR)
+library(rsample)
+library(glmnet)
+library(MASS)
+library(randomForest)
+```
+
+## Prepare Data
+
+Transcriptome Profiling
+
+```{r eval=FALSE}
+TP <- GDCquery(
+  project = "TCGA-PRAD",
+  data.category = "Transcriptome Profiling",
+  sample.type = "Primary Tumor",
+  experimental.strategy="RNA-Seq",
+  data.type="Gene Expression Quantification"
+)
+GDCdownload(TP,files.per.chunk = 12)
+TP.exp <- GDCprepare(query = TP,
+                      save = TRUE,
+                      save.filename = "TP.rda")
+```
+
+
+## load data
+```{r}
+load("TP.rda")
+se <- data
+```
+
+
+```{r}
+expr_counts <- assay(se, "unstranded")
+expr_tpm <- assay(se, "tpm_unstrand")
+expr_fpkm <- assay(se, "fpkm_unstrand")
+
+expr_counts[1:10, 1:2]
+symbol <- rowData(se)$gene_name
+head(symbol)
+expr_counts_symbol <- cbind(data.frame(symbol),
+                            as.data.frame(expr_counts))
+suppressPackageStartupMessages(library(tidyverse))
+expr_read <- expr_counts_symbol %>%
+  as_tibble() %>%
+  mutate(meanrow = rowMeans(.[, -1]), .before = 2) %>%
+  arrange(desc(meanrow)) %>%
+  distinct(symbol, .keep_all = T) %>%
+  dplyr::select(-meanrow) %>%
+  column_to_rownames(var = "symbol") %>%
+  as.data.frame()
+```
+
+```{r}
+sample <- read.csv("Supplementary_file_1.csv")
+prad_data <- filter(sample, sample$Study == "PRAD")
+prad_data <- prad_data[,c("Sample.ID","Tumor.MTDNA.Copy.Number","Normal.MTDNA.Copy.Number")]
+prad_data[1:10,]
+```
+```{r}
+prad_data<-prad_data[prad_data$Tumor.MTDNA.Copy.Number<1e-05,]
+
+ggplot(prad_data, aes(x = "", y = Tumor.MTDNA.Copy.Number)) +
+  geom_boxplot() +
+  labs(title = "MT copy number boxplot", y = "MT copy number") +
+  theme_minimal()
+```
+
+
+
+
+```{r}
+a <- ggplot(prad_data, aes(x = "", y = Tumor.MTDNA.Copy.Number)) +
+  geom_boxplot() +
+  labs(title = "MT copy number boxplot", y = "MT copy number") +
+  theme_minimal()
+```
+
+```{r}
+b <- ggplot(prad_data, aes(x = Tumor.MTDNA.Copy.Number)) +
+  geom_density(alpha = 0.6) +
+  labs(title = "MT copy number distribution plot", x = "MT copy number", y = "Frequency") +
+  theme_minimal()+
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+a + b
+```
+
+```{r}
+ge<-expr_read
+colnames(ge) <- substr(colnames(ge), 6, 12)
+col_remain <- c(prad_data$Sample.ID)
+ge <- ge[, colnames(ge) %in% col_remain]
+col_remain <- col_remain[col_remain != setdiff(col_remain, colnames(ge))]
+ge<-ge[,col_remain]
+```
+
+```{r}
+expr_read <- t(expr_read)
+expr_read <- as.data.frame(expr_read)
+expr_read$gene_id <- c(row.names(expr_read))
+expr_read$Sample.ID <- substr(expr_read$gene_id, 6, 12)
+matched_data <- merge(prad_data, expr_read, by = "Sample.ID")
+matched_data <-
+  matched_data %>% dplyr::select(
+    "gene_id",
+    "Sample.ID",
+    "Tumor.MTDNA.Copy.Number",
+    "Normal.MTDNA.Copy.Number",
+    everything()
+  )
+matched_data <-
+  matched_data[match(prad_data$Sample.ID, matched_data$Sample.ID), ]
+matched_data[1:10, 1:10]
+```
+
+```{r}
+# Remove non-expressed genes
+ge_filter <- ge
+ge_filter <- ge_filter[rowSums(ge_filter)>0,]
+```
+
+```{r}
+ge_result<- ge_filter[rowSums(ge_filter>=10)>=0.75*ncol(ge_filter),]
+ge_result[18000:18083,]
+```
+
+```{r}
+# keep <- rowSums(cpm(ge_result) >= 1) > 0 
+# ge_result <- ge_result[keep, ,]
+ge_result <- ge_result[rowSums(cpm(ge_result) >= 1) > 0, ]
+```
+
+```{r}
+ge_result[18030:18056,]
+```
+
+
+```{r}
+ge[1:100,]
+prad_data
+```
+
+```{r}
+setdiff(prad_data$Sample.ID,colnames(ge_result))
+prad_data <- subset(prad_data, Sample.ID != setdiff(prad_data$Sample.ID,colnames(ge_result)))
+identical(prad_data$Sample.ID,colnames(ge_result))
+```
+
+
+```{r}
+prad_data$Tumor.MTDNA.Copy.Number
+ge_result[1:100,]
+```
+
+```{r}
+X <- t(ge_result)
+X <- as.data.frame(X)
+```
+
+
+```{r}
+y<-prad_data$Tumor.MTDNA.Copy.Number
+patient_id <-prad_data$Sample.ID
+```
+
+```{r}
+df_predict <- cbind(y, X)
+colnames(df_predict) <- gsub("-", "_", colnames(df_predict))
+names(df_predict)[1] <- "MTCN"
+```
+
+
+```{r}
+# spilt dataset 
+X <- df_predict[, -1] 
+y <- df_predict[, 1] 
+
+set.seed(123) 
+data_split <- initial_split(df_predict, prop = 0.8)
+
+train_df <- training(data_split)
+test_df <- testing(data_split)
+```
+
+```{r}
+scaled_train <- as.data.frame(apply(train_df, 2, function(x) (x - min(x)) / (max(x) - min(x))))
+scaled_train[1:10,1:10]
+```
+
+```{r}
+correlation <- cor(scaled_train[, -which(names(scaled_train) == "MTCN")], scaled_train$MTCN, method = "pearson")
+correlation <- abs(correlation[,1])
+correlation_abs <- sort(abs(correlation), decreasing = TRUE)
+top_100_indices <- names(correlation_abs)[1:50]
+top_100_variables <- names(scaled_train)[which(names(scaled_train) %in% top_100_indices)]
+print(top_100_variables)
+```
+
+```{r}
+#scaled_train %>% select('MTCN', any_of(c(selected_columns)))
+scaled_train<-scaled_train[,c("MTCN",top_100_variables)]
+```
+
+```{r}
+# heatmap
+top_15_indices <- names(correlation_abs)[1:15]
+top_15_variables <- names(scaled_train)[which(names(scaled_train) %in% top_15_indices)]
+scaled_train_15<-scaled_train[,c("MTCN",top_15_variables)]
+cor_matrix <- cor(scaled_train_15)
+cor_df <- as.data.frame(as.table(cor_matrix))
+ggplot(cor_df, aes(x = Var1, y = Var2, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = round(Freq, 2)), color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+lm
+```{r,include = FALSE}
+initial_model <- lm(MTCN ~ ., data = scaled_train)
+lm_final_model <- step(initial_model,direction = "both")
+```
+
+```{R}
+summary(lm_final_model)
+```
+
+rlm
+```{r}
+rlm_model <- rlm(MTCN ~ ., data = scaled_train, method="MM")
+```
+
+
+```{r}
+summary(rlm_model)
+
+```
+
+
+
+Random forest
+
+```{r}
+task <- makeRegrTask(id = "my_data", data = scaled_train, target = "MTCN")
+set.seed(123)
+# 设置网格搜索的参数范围
+ps <- makeParamSet(
+  makeIntegerParam("ntree", lower = 2, upper = 5),
+  makeIntegerParam("mtry", lower = 2, upper = 5),
+  makeIntegerParam("nodesize", lower = 5, upper = 20)
+)
+
+# 进行网格搜索
+ctrl <- makeTuneControlGrid()
+res <- tuneParams("regr.randomForest", task, resampling = cv10, par.set = ps,
+                  control = ctrl)
+```
+
+
+```{r}
+rf_model <- randomForest(MTCN ~ ., data = scaled_train, ntree = 5, mtry = 4, nodesize = 13)
+summary(rf_model)
+```
+
+
+svm
+
+```{r}
+task1 <- makeRegrTask(data = scaled_train, target = "MTCN")
+learner <- makeLearner("regr.svm", predict.type = "response")
+params <- makeParamSet(
+  makeDiscreteParam("kernel", values = c("linear", "radial", "polynomial")),
+  makeNumericParam("cost", lower = 0.1, upper = 10),
+  makeNumericParam("epsilon", lower = 0.01, upper = 0.2)
+)
+cv <- makeResampleDesc("CV", iters = 5)
+ctrl1 <- makeTuneControlGrid()
+tuned_learner <- tuneParams(learner = learner, task = task1, resampling = cv,
+                            par.set = params,control = ctrl1)
+```
+
+```{r}
+svm_model <- svm(MTCN ~ ., data = scaled_train, kernel = "radial", cost = 1.2, eplison = 0.2)
+summary(svm_model)
+```
+
+test set 
+```{r}
+scaled_test <- as.data.frame(apply(test_df, 2, function(x) (x - min(x)) / (max(x) - min(x))))
+scaled_test<-scaled_test[,c("MTCN",top_100_variables)]
+scaled_test[1:10,1:10]
+```
+
+```{r}
+test_X <- scaled_test[,-1]
+test_y <- scaled_test[,1]
+```
+
+```{r}
+train_X <- scaled_train[, -1] 
+train_y <- scaled_train[, 1]
+```
+
+model
+```{r}
+lm_predict_result <- predict(lm_final_model, newdata = train_X)
+rlm_predict_result <- predict(rlm_model,newdata = train_X)
+rf_predict_result <- predict(rf_model,newdata = train_X)
+svm_predict_result <- predict(svm_model,newdata = train_X)
+```
+
+MSE
+```{r}
+true_value <- train_y
+true_value <- as.matrix(true_value)
+lm_mse <- colMeans((true_value - lm_predict_result)^2)
+rlm_mse <- colMeans((true_value - rlm_predict_result)^2)
+rf_mse <- colMeans((true_value - rf_predict_result)^2)
+svm_mse <- colMeans((true_value - svm_predict_result)^2)
+lm_mse
+rlm_mse
+rf_mse
+svm_mse
+```
+
+R2
+```{r}
+ss_tot_linear <- sum((true_value - mean(true_value))^2)
+ss_res_linear <- sum((true_value - lm_predict_result)^2)
+lm_r2 <- 1 - (ss_res_linear / ss_tot_linear)
+
+ss_tot_robust <- sum((true_value - mean(true_value))^2)
+ss_res_robust <- sum((true_value - rlm_predict_result)^2)
+rlm_r2 <- 1 - (ss_res_robust / ss_tot_robust)
+
+ss_tot_rf <- sum((true_value - mean(true_value))^2)
+ss_res_rf <- sum((true_value - rf_predict_result)^2)
+rf_r2 <- 1 - (ss_res_rf / ss_tot_rf)
+
+ss_tot_svr <- sum((true_value - mean(true_value))^2)
+ss_res_svr <- sum((true_value - svm_predict_result)^2)
+svm_r2 <- 1 - (ss_res_svr / ss_tot_svr)
+
+lm_r2
+rlm_r2
+rf_r2
+svm_r2
+```
+
+RMSE
+```{r}
+lm_rmse <-sqrt(lm_mse)
+rlm_rmse <-sqrt(rlm_mse)
+rf_rmse <-sqrt(rf_mse)
+svm_rmse <-sqrt(svm_mse)
+lm_rmse
+rlm_rmse
+rf_rmse
+svm_rmse
+```
+residual
+```{r}
+linear_residuals <- true_value - lm_predict_result
+robust_residuals <- true_value - rlm_predict_result
+rf_residuals <- true_value - rf_predict_result
+svr_residuals <- true_value - svm_predict_result
+par(mfrow = c(2, 2))
+plot(linear_residuals, main = "Linear Regression Residuals", xlab = "Index", ylab = "Residuals")
+abline(h = 0, col = "red")
+plot(robust_residuals, main = "Robust Linear Regression Residuals", xlab = "Index", ylab = "Residuals")
+abline(h = 0, col = "red")
+plot(rf_residuals, main = "Random Forest Residuals", xlab = "Index", ylab = "Residuals")
+abline(h = 0, col = "red")
+plot(svr_residuals, main = "Support Vector Regression Residuals", xlab = "Index", ylab = "Residuals")
+abline(h = 0, col = "red")
+```
+
+predict plot
+```{r}
+par(mfrow = c(2, 2))
+plot(true_value, lm_predict_result, main = "Linear Regression Prediction", 
+     xlab = "True Values", ylab = "Predicted Values", pch = 16)
+abline(a=0,b=1,col = "red")
+plot(true_value, rlm_predict_result, main = "Robust Linear Regression Prediction", 
+     xlab = "True Values", ylab = "Predicted Values", pch = 16)
+abline(a=0,b=1,col = "red")
+plot(true_value, rf_predict_result, main = "Random Forest Prediction", 
+     xlab = "True Values", ylab = "Predicted Values", pch = 16)
+abline(a=0,b=1,col = "red")
+plot(true_value, svm_predict_result, main = "Support Vector Regression Prediction", 
+     xlab = "True Values", ylab = "Predicted Values", pch = 16)
+abline(a=0,b=1,col = "red")
+```
+
+```{r}
+test_true_value<-test_y
+test_true_value<-as.matrix(test_true_value)
+
+svm_test_predict_result <- predict(svm_model, newdata = test_X)
+svm_test_mse <- colMeans((test_true_value - svm_test_predict_result)^2)
+svm_test_rmse <-sqrt(svm_test_mse)
+ss_tot_svm_test <- sum((test_true_value - mean(test_true_value))^2)
+ss_res_svm_test <- sum((test_true_value - svm_test_predict_result)^2)
+svm_r2_test <- 1 - (ss_res_svm_test / ss_tot_svm_test)
+
+svm_test_mse
+svm_test_rmse
+svm_r2_test
+```
+
+```{r}
+svm_test_residuals <- test_true_value - svm_test_predict_result
+par(mfrow = c(2, 2))
+plot(svm_test_residuals, main = "Support Vector Regression Residuals", xlab = "Index", ylab = "Residuals")
+abline(h = 0, col = "red")
+plot(test_true_value, svm_test_predict_result, main = "Support Vector Regression Prediction", 
+     xlab = "True Values", ylab = "Predicted Values", pch = 16)
+abline(a=0,b=1,col = "red")
+
+```
+
+
+```{r}
+lm_test_predict_result <- predict(lm_final_model, newdata = test_X)
+rlm_test_predict_result <- predict(rlm_model, newdata = test_X)
+rf_test_predict_result <- predict(rf_model, newdata = test_X)
+lm_test_residuals <- test_true_value - lm_test_predict_result
+rlm_test_residuals <- test_true_value - rlm_test_predict_result
+rf_test_residuals <- test_true_value - rf_test_predict_result
+
+par(mfrow = c(3, 2))
+
+plot(lm_test_residuals, main = "Linear Regression Residuals", xlab = "Index", ylab = "Residuals")
+abline(h = 0, col = "red")
+plot(test_true_value, lm_test_predict_result, main = "Linear Regression Prediction", 
+     xlab = "True Values", ylab = "Predicted Values", pch = 16)
+abline(a=0,b=1,col = "red")
+
+plot(rlm_test_residuals, main = "Robust Linear Regression Residuals", xlab = "Index", ylab = "Residuals")
+abline(h = 0, col = "red")
+plot(test_true_value, rlm_test_predict_result, main = "Robust Linear Regression Prediction", 
+     xlab = "True Values", ylab = "Predicted Values", pch = 16)
+abline(a=0,b=1,col = "red")
+
+plot(rf_test_residuals, main = "Random Forest Residuals", xlab = "Index", ylab = "Residuals")
+abline(h = 0, col = "red")
+plot(test_true_value, rf_test_predict_result, main = "Random Forest Prediction", 
+     xlab = "True Values", ylab = "Predicted Values", pch = 16)
+abline(a=0,b=1,col = "red")
+
+```
+
+
+```{r}
+rf_test_mse <- colMeans((test_true_value - rf_test_predict_result)^2)
+rf_test_rmse <-sqrt(rf_test_mse)
+ss_tot_rf_test <- sum((test_true_value - mean(test_true_value))^2)
+ss_res_rf_test <- sum((test_true_value - rf_test_predict_result)^2)
+rf_r2_test <- 1 - (ss_res_rf_test / ss_tot_rf_test)
+
+lm_test_mse <- colMeans((test_true_value - lm_test_predict_result)^2)
+lm_test_rmse <-sqrt(lm_test_mse)
+ss_tot_lm_test <- sum((test_true_value - mean(test_true_value))^2)
+ss_res_lm_test <- sum((test_true_value - lm_test_predict_result)^2)
+lm_r2_test <- 1 - (ss_res_lm_test / ss_tot_lm_test)
+
+rlm_test_mse <- colMeans((test_true_value - rlm_test_predict_result)^2)
+rlm_test_rmse <-sqrt(rlm_test_mse)
+ss_tot_rlm_test <- sum((test_true_value - mean(test_true_value))^2)
+ss_res_rlm_test <- sum((test_true_value - rlm_test_predict_result)^2)
+rlm_r2_test <- 1 - (ss_res_rlm_test / ss_tot_rlm_test)
+
+rf_test_mse <- colMeans((test_true_value - rf_test_predict_result)^2)
+rf_test_rmse <-sqrt(rf_test_mse)
+ss_tot_rf_test <- sum((test_true_value - mean(test_true_value))^2)
+ss_res_rf_test <- sum((test_true_value - rf_test_predict_result)^2)
+rf_r2_test <- 1 - (ss_res_rf_test / ss_tot_rf_test)
+
+lm_test_mse
+lm_test_rmse
+lm_r2_test
+
+rlm_test_mse
+rlm_test_rmse
+rlm_r2_test
+
+rf_test_mse
+rf_test_rmse
+rf_r2_test
+
+svm_test_mse
+svm_test_rmse
+svm_r2_test
+```
+
+
+```{r}
+par(mfrow = c(2, 2))
+result1 <- runs.test(linear_residuals,plot = TRUE)
+result2 <- runs.test(robust_residuals,plot = TRUE)
+result3 <- runs.test(rf_residuals,plot = TRUE)
+result4 <- runs.test(svr_residuals,plot = TRUE)
+result1
+result2
+result3
+result4
+
+
+```
+
+
+```{r}
+result5 <- runs.test(lm_test_residuals,plot = TRUE)
+result5
+```
